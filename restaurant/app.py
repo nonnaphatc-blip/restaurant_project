@@ -1,0 +1,395 @@
+"""Restaurant system - Flask entry point (also the Vercel entry point)."""
+import hmac
+import os
+import re
+import secrets
+import uuid
+
+from flask import Flask, g, jsonify, render_template, request, send_from_directory, session
+from werkzeug.exceptions import HTTPException
+
+import auth
+import logger
+import services
+import storage
+from auth import role_required
+from storage import AppError
+
+ALLOWED_EXT = {"png", "jpg", "jpeg", "webp"}
+
+
+def load_secret():
+    key = os.environ.get("SECRET_KEY")
+    if key:
+        return key
+    path = os.path.join(storage.DATA_DIR, "secret.key")
+    try:
+        os.makedirs(storage.DATA_DIR, exist_ok=True)
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                return f.read().strip()
+        key = secrets.token_hex(32)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(key)
+        return key
+    except OSError:
+        return secrets.token_hex(32)  # sessions reset on restart; set SECRET_KEY to avoid this
+
+
+app = Flask(__name__)
+app.config.update(SECRET_KEY=load_secret(), SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+                  SESSION_COOKIE_SECURE=bool(os.environ.get("VERCEL")), MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+                  PERMANENT_SESSION_LIFETIME=8 * 3600)
+app.json.ensure_ascii = False
+app.register_blueprint(auth.bp)
+
+
+# ---------- security + errors ----------
+def csrf_token():
+    return session.setdefault("csrf", secrets.token_hex(16))
+
+
+@app.context_processor
+def inject():
+    return {"user": g.get("user"), "csrf_token": csrf_token, "brand": "BAANRAO"}
+
+
+@app.before_request
+def csrf_protect():
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        sent = request.headers.get("X-CSRF-Token") or request.form.get("_csrf", "")
+        if not sent or not hmac.compare_digest(str(sent), session.get("csrf", "")):
+            raise AppError("เซสชันหมดอายุ กรุณารีเฟรชหน้าแล้วลองใหม่", 400)
+
+
+@app.after_request
+def security_headers(resp):
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data:; style-src 'self' https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; script-src 'self'; frame-ancestors 'none'; "
+        "base-uri 'self'; form-action 'self'")
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "same-origin"
+    if request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def fail(message, status):
+    if request.path.startswith("/api/"):
+        return jsonify(ok=False, error=message), status
+    return render_template("error.html", message=message, status=status), status
+
+
+@app.errorhandler(AppError)
+def on_app_error(e):
+    return fail(e.message, e.status)
+
+
+@app.errorhandler(HTTPException)
+def on_http_error(e):
+    known = {404: "ไม่พบหน้าที่ต้องการ", 405: "ไม่รองรับคำขอนี้", 413: "ไฟล์ใหญ่เกินไป (สูงสุด 2MB)"}
+    return fail(known.get(e.code, "คำขอไม่ถูกต้อง"), e.code or 400)
+
+
+@app.errorhandler(Exception)
+def on_error(e):
+    app.logger.exception("unhandled error")  # traceback goes to the server log only
+    return fail("เกิดข้อผิดพลาดภายในระบบ กรุณาลองใหม่อีกครั้ง", 500)
+
+
+# ---------- helpers ----------
+def body():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise AppError("ข้อมูลที่ส่งมาไม่ถูกต้อง")
+    return data
+
+
+def ok(**payload):
+    return jsonify(ok=True, **payload)
+
+
+def audit(action, entity, ref="", detail=""):
+    logger.log_action(g.user["username"] if g.user else "guest", action, entity, ref, detail)
+
+
+def public_limit(name, limit=30, window=60):
+    auth.rate_limit(f"{name}:{auth.client_ip()}", limit, window)
+
+
+# ---------- pages ----------
+@app.get("/")
+def home():
+    db = storage.load()
+    return render_template("home.html", categories=sorted(db["categories"], key=lambda c: c["sort"]),
+                           menu=db["menu"], today=storage.today_str())
+
+
+@app.get("/pos")
+@role_required("admin", "cashier")
+def pos():
+    return render_template("pos.html")
+
+
+@app.get("/kitchen")
+@role_required("admin", "cashier", "kitchen")
+def kitchen():
+    return render_template("kitchen.html")
+
+
+@app.get("/admin")
+@role_required("admin", "cashier")
+def admin():
+    return render_template("admin.html")
+
+
+@app.get("/t/<int:table_id>")
+def customer_table(table_id):
+    token = request.args.get("k", "")
+    table = services.check_table_token(storage.load(), table_id, token)
+    return render_template("order.html", table=table, token=token)
+
+
+@app.get("/receipt/<int:bill_id>")
+@role_required("admin", "cashier")
+def receipt(bill_id):
+    return render_template("receipt.html", bill=services.need(storage.load(), "bills", bill_id, "ไม่พบใบเสร็จ"))
+
+
+@app.get("/uploads/<name>")
+def uploads(name):
+    if not re.fullmatch(services.IMAGE_RE, name):
+        raise AppError("ไม่พบไฟล์", 404)
+    return send_from_directory(storage.UPLOAD_DIR, name)
+
+
+# ---------- API: menu, tables, orders ----------
+@app.get("/api/menu")
+def api_menu():
+    return ok(**services.menu_view(storage.load()))
+
+
+@app.get("/api/tables")
+@role_required(*auth.STAFF)
+def api_tables():
+    return ok(tables=services.tables_view(storage.load()))
+
+
+@app.patch("/api/tables/<int:table_id>")
+@role_required("admin", "cashier")
+def api_table_status(table_id):
+    with storage.transaction() as db:
+        detail = services.set_table_status(db, table_id, str(body().get("status", "")))
+    audit("table_status", "tables", table_id, detail)
+    return ok()
+
+
+@app.post("/api/tables/<int:table_id>/move")
+@role_required("admin", "cashier")
+def api_table_move(table_id):
+    data = body()
+    with storage.transaction() as db:
+        detail = services.move_table(db, table_id, services.to_int(data.get("to")), bool(data.get("merge")))
+    audit("table_move", "tables", table_id, detail)
+    return ok()
+
+
+@app.get("/api/orders/<int:table_id>")
+@role_required("admin", "cashier")
+def api_order(table_id):
+    return ok(**services.order_view(storage.load(), table_id))
+
+
+@app.post("/api/orders/<int:table_id>/items")
+@role_required("admin", "cashier")
+def api_add_item(table_id):
+    data = body()
+    with storage.transaction() as db:
+        item = services.add_item(db, table_id, data.get("menu_id"), data.get("qty", 1),
+                                 data.get("options"), data.get("note"), "staff")
+    return ok(item=item)
+
+
+@app.patch("/api/orders/<int:order_id>/items/<int:item_id>")
+@role_required("admin", "cashier", "kitchen")
+def api_update_item(order_id, item_id):
+    data = body()
+    with storage.transaction() as db:
+        detail = services.update_item(db, order_id, item_id, data, g.user["role"])
+    if data.get("status") == "cancelled" or "qty" in data:
+        audit("order_item", "orders", order_id, detail)
+    return ok()
+
+
+@app.post("/api/orders/<int:order_id>/checkout")
+@role_required("admin", "cashier")
+def api_checkout(order_id):
+    data = body()
+    if data.get("preview"):
+        return ok(bill=services.checkout(storage.load(), order_id, data, g.user, commit=False))
+    with storage.transaction() as db:
+        bill = services.checkout(db, order_id, data, g.user)
+    audit("checkout", "bills", bill["id"], f"{bill['receipt_no']} {bill['table_name']} ฿{bill['total']} ({bill['method']})")
+    return ok(bill=bill)
+
+
+@app.get("/api/kitchen")
+@role_required("admin", "cashier", "kitchen")
+def api_kitchen():
+    return ok(tickets=services.kitchen_view(storage.load()))
+
+
+@app.get("/api/events")
+@role_required(*auth.STAFF)
+def api_events():
+    since = services.to_int(request.args.get("since"), -1)
+    return ok(**services.events_for(storage.load(), g.user["role"], since))
+
+
+# ---------- API: customer (QR, reservation, queue) ----------
+@app.get("/api/public/order/<int:table_id>")
+def api_public_order(table_id):
+    db = storage.load()
+    table = services.check_table_token(db, table_id, request.args.get("k", ""))
+    return ok(table=table["name"], billing=table["status"] == "billing", **services.order_view(db, table_id))
+
+
+@app.post("/api/public/order/<int:table_id>")
+def api_public_send(table_id):
+    public_limit("order")
+    data = body()
+    with storage.transaction() as db:
+        services.customer_order(db, table_id, data.get("k", ""), data.get("items"))
+    return ok()
+
+
+@app.post("/api/public/order/<int:table_id>/bill")
+def api_public_bill(table_id):
+    public_limit("bill")
+    with storage.transaction() as db:
+        services.check_table_token(db, table_id, body().get("k", ""))
+        services.set_table_status(db, table_id, "billing")
+    return ok()
+
+
+@app.post("/api/public/reservations")
+def api_public_reserve():
+    public_limit("reserve", 5, 600)
+    with storage.transaction() as db:
+        services.public_reservation(db, body())
+    return ok(message="ส่งคำขอจองแล้ว ร้านจะติดต่อกลับเพื่อยืนยัน")
+
+
+@app.post("/api/public/queue")
+def api_public_queue():
+    public_limit("queue", 5, 600)
+    with storage.transaction() as db:
+        result = services.public_queue(db, body())
+    return ok(message=f"คิวของคุณคือหมายเลข {result['number']} (รอก่อนหน้า {result['ahead']} คิว)")
+
+
+# ---------- API: admin panel (CRUD, dashboard, logs, settings, upload) ----------
+def entity_or_404(name):
+    cfg = services.ENTITIES.get(name)
+    if cfg is None:
+        raise AppError("ไม่พบข้อมูล", 404)
+    if g.user["role"] not in cfg["roles"]:
+        raise AppError("คุณไม่มีสิทธิ์จัดการข้อมูลนี้", 403)
+    return name
+
+
+@app.get("/api/admin/dashboard")
+@role_required("admin")
+def api_dashboard():
+    date = services.valid_date(request.args.get("date")) or storage.today_str()
+    return ok(dashboard=services.dashboard(storage.load(), date))
+
+
+@app.get("/api/admin/logs")
+@role_required("admin")
+def api_logs():
+    return ok(**services.query(logger.read_logs(), request.args, ("user", "action", "entity", "detail"),
+                               ("action", "entity", "user"), "id", "desc"))
+
+
+@app.route("/api/admin/settings", methods=("GET", "PUT"))
+@role_required("admin")
+def api_settings():
+    if request.method == "GET":
+        return ok(settings=storage.load()["settings"])
+    data = body()
+    with storage.transaction() as db:
+        detail = services.update_settings(db, data)
+    audit("update", "settings", "", detail)
+    return ok()
+
+
+@app.post("/api/admin/upload")
+@role_required("admin")
+def api_upload():
+    file = request.files.get("file")
+    if file is None or not file.filename:
+        raise AppError("กรุณาเลือกไฟล์")
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+    if ext not in ALLOWED_EXT:
+        raise AppError("รองรับเฉพาะไฟล์ png, jpg, webp")
+    try:
+        if not services.sniff_image(file.stream.read(12)):
+            raise AppError("ไฟล์นี้ไม่ใช่รูปภาพ")
+        file.stream.seek(0)
+        name = f"{uuid.uuid4().hex}.{ext}"
+        os.makedirs(storage.UPLOAD_DIR, exist_ok=True)
+        file.save(os.path.join(storage.UPLOAD_DIR, name))
+    except OSError:
+        raise AppError("บันทึกไฟล์ไม่สำเร็จ", 500) from None
+    audit("upload", "menu", name)
+    return ok(name=name)
+
+
+@app.get("/api/admin/<entity>")
+@role_required("admin", "cashier")
+def api_list(entity):
+    return ok(**services.list_entity(storage.load(), entity_or_404(entity), request.args))
+
+
+@app.post("/api/admin/<entity>")
+@role_required("admin", "cashier")
+def api_create(entity):
+    data = body()
+    with storage.transaction() as db:
+        row, detail = services.create_entity(db, entity_or_404(entity), data)
+    audit("create", entity, row["id"], detail)
+    return ok(item=row)
+
+
+@app.put("/api/admin/<entity>/<int:id_>")
+@role_required("admin", "cashier")
+def api_update(entity, id_):
+    data = body()
+    with storage.transaction() as db:
+        row, detail = services.update_entity(db, entity_or_404(entity), id_, data)
+    audit("update", entity, id_, detail)
+    return ok(item=row)
+
+
+@app.delete("/api/admin/<entity>/<int:id_>")
+@role_required("admin", "cashier")
+def api_delete(entity, id_):
+    with storage.transaction() as db:
+        detail = services.delete_entity(db, entity_or_404(entity), id_, g.user)
+    audit("delete", entity, id_, detail)
+    return ok()
+
+
+def init_data():
+    with storage.transaction() as db:
+        services.seed(db)
+
+
+init_data()
+
+if __name__ == "__main__":
+    app.run(debug=False, port=int(os.environ.get("PORT", 8000)))
+
